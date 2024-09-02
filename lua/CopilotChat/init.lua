@@ -933,4 +933,19 @@ function M.setup(config)
   end, { nargs = '*', force = true, complete = complete_load })
 end
 
+M.submit = function()
+  local bufnr = state.chat.bufnr
+  local chat_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local lines, start_line, end_line, line_count =
+    find_lines_between_separator(chat_lines, M.config.separator .. '$')
+  local input = vim.trim(table.concat(lines, '\n'))
+  if input ~= '' then
+    -- If we are entering the input at the end, replace it
+    if line_count == end_line then
+      vim.api.nvim_buf_set_lines(bufnr, start_line, end_line, false, { '' })
+    end
+    M.ask(input, state.config, state.source)
+  end
+end
+
 return M
