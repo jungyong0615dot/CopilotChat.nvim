@@ -228,6 +228,69 @@
       "avatar_url": "https://avatars.githubusercontent.com/u/81941908?v=4",
       "profile": "https://github.com/sjonpaulbrown-cc",
       "contributions": ["code"]
+    },
+    {
+      "login": "renxzen",
+      "name": "Renzo Mondragón",
+      "avatar_url": "https://avatars.githubusercontent.com/u/13023797?v=4",
+      "profile": "https://github.com/renxzen",
+      "contributions": ["code", "doc"]
+    },
+    {
+      "login": "fjchen7",
+      "name": "fjchen7",
+      "avatar_url": "https://avatars.githubusercontent.com/u/10106636?v=4",
+      "profile": "https://github.com/fjchen7",
+      "contributions": ["code"]
+    },
+    {
+      "login": "radwo",
+      "name": "Radosław Woźniak",
+      "avatar_url": "https://avatars.githubusercontent.com/u/184065?v=4",
+      "profile": "https://github.com/radwo",
+      "contributions": ["code"]
+    },
+    {
+      "login": "JakubPecenka",
+      "name": "JakubPecenka",
+      "avatar_url": "https://avatars.githubusercontent.com/u/87969308?v=4",
+      "profile": "https://github.com/JakubPecenka",
+      "contributions": ["code"]
+    },
+    {
+      "login": "thomastthai",
+      "name": "thomastthai",
+      "avatar_url": "https://avatars.githubusercontent.com/u/16532581?v=4",
+      "profile": "https://github.com/thomastthai",
+      "contributions": ["doc"]
+    },
+    {
+      "login": "liskin",
+      "name": "Tomáš Janoušek",
+      "avatar_url": "https://avatars.githubusercontent.com/u/300342?v=4",
+      "profile": "https://lisk.in/",
+      "contributions": ["code"]
+    },
+    {
+      "login": "Moriango",
+      "name": "Toddneal Stallworth",
+      "avatar_url": "https://avatars.githubusercontent.com/u/43554061?v=4",
+      "profile": "https://github.com/Moriango",
+      "contributions": ["doc"]
+    },
+    {
+      "login": "taketwo",
+      "name": "Sergey Alexandrov",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1241736?v=4",
+      "profile": "https://github.com/taketwo",
+      "contributions": ["code"]
+    },
+    {
+      "login": "lemeb",
+      "name": "Léopold Mebazaa",
+      "avatar_url": "https://avatars.githubusercontent.com/u/7331643?v=4",
+      "profile": "https://github.com/lemeb",
+      "contributions": ["code"]
     }
   ],
   "contributorsPerLine": 7,

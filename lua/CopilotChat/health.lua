@@ -4,6 +4,7 @@ local start = vim.health.start or vim.health.report_start
 local error = vim.health.error or vim.health.report_error
 local warn = vim.health.warn or vim.health.report_warn
 local ok = vim.health.ok or vim.health.report_ok
+local info = vim.health.info or vim.health.report_info
 
 --- Run a command and handle potential errors
 ---@param executable string
@@ -39,6 +40,9 @@ local function treesitter_parser_available(ft)
 end
 
 function M.check()
+  start('CopilotChat.nvim')
+  info('If you are facing any issues, also see :CopilotChatDebugInfo for more information.')
+
   start('CopilotChat.nvim [core]')
 
   local vim_version = vim.trim(vim.api.nvim_command_output('version'))
@@ -75,6 +79,15 @@ function M.check()
     ok('git: ' .. git_version)
   end
 
+  local lynx_version = run_command('lynx', '-version')
+  if lynx_version == false then
+    warn(
+      'lynx: missing, optional for improved fetching of url contents. See "https://lynx.invisible-island.net/".'
+    )
+  else
+    ok('lynx: ' .. lynx_version)
+  end
+
   start('CopilotChat.nvim [dependencies]')
 
   if lualib_installed('plenary') then
@@ -99,7 +112,7 @@ function M.check()
     ok('tiktoken_core: installed')
   else
     warn(
-      'tiktoken_core: missing, optional for token counting. See README for installation instructions.'
+      'tiktoken_core: missing, optional for accurate token counting. See README for installation instructions.'
     )
   end
 
