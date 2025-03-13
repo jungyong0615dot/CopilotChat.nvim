@@ -13,13 +13,18 @@ local M = {}
 --- Pick an action from a list of actions
 ---@param pick_actions CopilotChat.integrations.actions?: A table with the actions to pick from
 ---@param opts table?: Telescope options
+---@deprecated Use |CopilotChat.select_prompt| instead
 function M.pick(pick_actions, opts)
   if not pick_actions or not pick_actions.actions or vim.tbl_isempty(pick_actions.actions) then
     return
   end
 
   utils.return_to_normal_mode()
-  opts = themes.get_dropdown(opts or {})
+
+  if not (opts and opts.theme) then
+    opts = themes.get_dropdown(opts or {})
+  end
+
   pickers
     .new(opts, {
       prompt_title = pick_actions.prompt,

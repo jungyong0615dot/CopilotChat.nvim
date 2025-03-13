@@ -5,6 +5,29 @@ local scandir = require('plenary.scandir')
 local M = {}
 M.timers = {}
 
+M.scan_args = {
+  max_count = 2500,
+  max_depth = 50,
+  no_ignore = false,
+}
+
+M.curl_args = {
+  timeout = 30000,
+  raw = {
+    '--retry',
+    '2',
+    '--retry-delay',
+    '1',
+    '--keepalive-time',
+    '60',
+    '--no-compressed',
+    '--connect-timeout',
+    '10',
+    '--tcp-nodelay',
+    '--no-buffer',
+  },
+}
+
 ---@class Class
 ---@field new fun(...):table
 ---@field init fun(self, ...)
@@ -79,12 +102,6 @@ function M.ordered_map()
   }
 end
 
---- Check if the current version of neovim is stable
----@return boolean
-function M.is_stable()
-  return vim.fn.has('nvim-0.10.0') == 0
-end
-
 --- Writes text to a temporary file and returns path
 ---@param text string The text to write
 ---@return string?
@@ -97,26 +114,6 @@ function M.temp_file(text)
   f:write(text)
   f:close()
   return temp_file
-end
-
---- Finds the path to the user's config directory
----@return string?
-function M.config_path()
-  local config = vim.fn.expand('$XDG_CONFIG_HOME')
-  if config and vim.fn.isdirectory(config) > 0 then
-    return config
-  end
-  if vim.fn.has('win32') > 0 then
-    config = vim.fn.expand('$LOCALAPPDATA')
-    if not config or vim.fn.isdirectory(config) == 0 then
-      config = vim.fn.expand('$HOME/AppData/Local')
-    end
-  else
-    config = vim.fn.expand('$HOME/.config')
-  end
-  if config and vim.fn.isdirectory(config) > 0 then
-    return config
-  end
 end
 
 --- Blend a color with the neovim background
@@ -144,8 +141,9 @@ function M.return_to_normal_mode()
   local mode = vim.fn.mode():lower()
   if mode:find('v') then
     vim.cmd([[execute "normal! \<Esc>"]])
+  elseif mode ~= 'n' then
+    vim.cmd('stopinsert')
   end
-  vim.cmd('stopinsert')
 end
 
 --- Mark a function as deprecated
@@ -200,10 +198,31 @@ end
 ---@return string|nil
 function M.filetype(filename)
   local ft = vim.filetype.match({ filename = filename })
+
+  -- weird TypeScript bug for vim.filetype.match
+  -- see: https://github.com/neovim/neovim/issues/27265
+  if not ft then
+    local base_name = vim.fs.basename(filename)
+    local split_name = vim.split(base_name, '%.')
+    if #split_name > 1 then
+      local ext = split_name[#split_name]
+      if ext == 'ts' then
+        ft = 'typescript'
+      end
+    end
+  end
+
   if ft == '' then
     return nil
   end
   return ft
+end
+
+--- Get the file name
+---@param filepath string The file path
+---@return string
+function M.filename(filepath)
+  return vim.fs.basename(filepath)
 end
 
 --- Get the file path
@@ -223,19 +242,6 @@ function M.uuid()
       return string.format('%x', v)
     end)
   )
-end
-
---- Generate machine id
----@return string
-function M.machine_id()
-  local length = 65
-  local hex_chars = '0123456789abcdef'
-  local hex = ''
-  for _ = 1, length do
-    local index = math.random(1, #hex_chars)
-    hex = hex .. hex_chars:sub(index, index)
-  end
-  return hex
 end
 
 --- Generate a quick hash
@@ -280,61 +286,201 @@ function M.win_cwd(winnr)
   return dir
 end
 
+--- Decode json
+---@param body string The json string
+---@return table, string?
+function M.json_decode(body)
+  local ok, data = pcall(vim.json.decode, body, {
+    luanil = {
+      object = true,
+      array = true,
+    },
+  })
+
+  if ok then
+    return data
+  end
+
+  return {}, data
+end
+
+--- Store curl global arguments
+---@param args table The arguments
+---@return table
+function M.curl_store_args(args)
+  M.curl_args = vim.tbl_deep_extend('force', M.curl_args, args)
+  return M.curl_args
+end
+
 --- Send curl get request
 ---@param url string The url
 ---@param opts table? The options
+---@async
 M.curl_get = async.wrap(function(url, opts, callback)
-  curl.get(
-    url,
-    vim.tbl_deep_extend('force', opts or {}, {
-      callback = callback,
-      on_error = function(err)
-        err = M.make_string(err and err.stderr or err)
-        callback(nil, err)
-      end,
-    })
-  )
+  local args = {
+    on_error = function(err)
+      callback(nil, err and err.stderr or err)
+    end,
+  }
+
+  args = vim.tbl_deep_extend('force', M.curl_args, args)
+  args = vim.tbl_deep_extend('force', args, opts or {})
+
+  args.callback = function(response)
+    if response and not vim.startswith(tostring(response.status), '20') then
+      callback(response, response.body)
+      return
+    end
+
+    if not args.json_response then
+      callback(response)
+      return
+    end
+
+    local body, err = M.json_decode(tostring(response.body))
+    if err then
+      callback(response, err)
+    else
+      response.body = body
+      callback(response)
+    end
+  end
+
+  curl.get(url, args)
 end, 3)
 
 --- Send curl post request
 ---@param url string The url
 ---@param opts table? The options
+---@async
 M.curl_post = async.wrap(function(url, opts, callback)
-  curl.post(
-    url,
-    vim.tbl_deep_extend('force', opts or {}, {
-      callback = callback,
-      on_error = function(err)
-        err = M.make_string(err and err.stderr or err)
-        callback(nil, err)
+  local args = {
+    callback = callback,
+    on_error = function(err)
+      callback(nil, err and err.stderr or err)
+    end,
+  }
+
+  args = vim.tbl_deep_extend('force', M.curl_args, args)
+  args = vim.tbl_deep_extend('force', args, opts or {})
+
+  if args.json_response then
+    args.headers = vim.tbl_deep_extend('force', args.headers or {}, {
+      Accept = 'application/json',
+    })
+  end
+
+  args.callback = function(response)
+    if response and not vim.startswith(tostring(response.status), '20') then
+      callback(response, response.body)
+      return
+    end
+
+    if not args.json_response then
+      callback(response)
+      return
+    end
+
+    local body, err = M.json_decode(tostring(response.body))
+    if err then
+      callback(response, err)
+    else
+      response.body = body
+      callback(response)
+    end
+  end
+
+  if args.json_request then
+    args.headers = vim.tbl_deep_extend('force', args.headers or {}, {
+      ['Content-Type'] = 'application/json',
+    })
+
+    args.body = M.temp_file(vim.json.encode(args.body))
+  end
+
+  curl.post(url, args)
+end, 3)
+
+---@class CopilotChat.utils.scan_dir_opts
+---@field max_count number? The maximum number of files to scan
+---@field max_depth number? The maximum depth to scan
+---@field glob? string The glob pattern to match files
+---@field hidden? boolean Whether to include hidden files
+---@field no_ignore? boolean Whether to respect or ignore .gitignore
+
+--- Scan a directory
+---@param path string The directory path
+---@param opts CopilotChat.utils.scan_dir_opts? The options
+---@async
+M.scan_dir = async.wrap(function(path, opts, callback)
+  opts = vim.tbl_deep_extend('force', M.scan_args, opts or {})
+
+  -- Use ripgrep if available
+  if vim.fn.executable('rg') == 1 then
+    local cmd = { 'rg' }
+
+    if opts.glob then
+      table.insert(cmd, '-g')
+      table.insert(cmd, opts.glob)
+    end
+
+    if opts.max_depth then
+      table.insert(cmd, '-d')
+      table.insert(cmd, tostring(opts.max_depth))
+    end
+
+    if opts.no_ignore then
+      table.insert(cmd, '--no-ignore')
+    end
+
+    if opts.hidden then
+      table.insert(cmd, '--hidden')
+    end
+
+    table.insert(cmd, '--files')
+    table.insert(cmd, path)
+
+    vim.system(cmd, { text = true }, function(result)
+      local files = {}
+      if result and result.code == 0 and result.stdout ~= '' then
+        files = vim.tbl_filter(function(file)
+          return file ~= ''
+        end, vim.split(result.stdout, '\n'))
+
+        if opts.max_count and opts.max_count > 0 then
+          files = vim.list_slice(files, 1, opts.max_count)
+        end
+      end
+
+      callback(files)
+    end)
+
+    return
+  end
+
+  -- Fall back to scandir if rg is not available or fails
+  scandir.scan_dir_async(
+    path,
+    vim.tbl_deep_extend('force', opts, {
+      depth = opts.max_depth,
+      add_dirs = false,
+      search_pattern = M.glob_to_pattern(opts.glob),
+      respect_gitignore = not opts.no_ignore,
+      on_exit = function(files)
+        if opts.max_count and opts.max_count > 0 then
+          files = vim.list_slice(files, 1, opts.max_count)
+        end
+        callback(files)
       end,
     })
   )
 end, 3)
 
---- Scan a directory
----@param path string The directory path
----@param opts table The options
-M.scan_dir = async.wrap(function(path, opts, callback)
-  scandir.scan_dir_async(
-    path,
-    vim.tbl_deep_extend('force', opts, {
-      on_exit = callback,
-    })
-  )
-end, 3)
-
---- Check if a file exists
----@param path string The file path
-M.file_exists = function(path)
-  local err, stat = async.uv.fs_stat(path)
-  return err == nil and stat ~= nil
-end
-
 --- Get last modified time of a file
 ---@param path string The file path
 ---@return number?
-M.file_mtime = function(path)
+---@async
+function M.file_mtime(path)
   local err, stat = async.uv.fs_stat(path)
   if err or not stat then
     return nil
@@ -344,7 +490,8 @@ end
 
 --- Read a file
 ---@param path string The file path
-M.read_file = function(path)
+---@async
+function M.read_file(path)
   local err, fd = async.uv.fs_open(path, 'r', 438)
   if err or not fd then
     return nil
@@ -366,8 +513,239 @@ end
 
 --- Call a system command
 ---@param cmd table The command
+---@async
 M.system = async.wrap(function(cmd, callback)
   vim.system(cmd, { text = true }, callback)
 end, 2)
+
+--- Schedule a function only when needed (not on main thread)
+---@param callback function The callback
+---@async
+M.schedule_main = async.wrap(function(callback)
+  if vim.in_fast_event() then
+    -- In a fast event, need to schedule
+    vim.schedule(function()
+      callback()
+    end)
+  else
+    -- Already on main thread, call directly
+    callback()
+  end
+end, 1)
+
+--- Get the info for a key.
+---@param name string
+---@param key table
+---@param surround string|nil
+---@return string
+function M.key_to_info(name, key, surround)
+  if not surround then
+    surround = ''
+  end
+
+  local out = ''
+  if key.normal and key.normal ~= '' then
+    out = out .. surround .. key.normal .. surround
+  end
+  if key.insert and key.insert ~= '' and key.insert ~= key.normal then
+    if out ~= '' then
+      out = out .. ' or '
+    end
+    out = out .. surround .. key.insert .. surround .. ' in insert mode'
+  end
+
+  if out == '' then
+    return out
+  end
+
+  return out .. ' to ' .. name:gsub('_', ' ')
+end
+
+--- Check if a value is empty
+---@param v any The value
+---@return boolean
+function M.empty(v)
+  if not v then
+    return true
+  end
+
+  if type(v) == 'table' then
+    return vim.tbl_isempty(v)
+  end
+
+  if type(v) == 'string' then
+    return vim.trim(v) == ''
+  end
+
+  return false
+end
+
+--- Convert glob pattern to regex pattern
+--- https://github.com/davidm/lua-glob-pattern/blob/master/lua/globtopattern.lua
+---@param g string The glob pattern
+---@return string
+function M.glob_to_pattern(g)
+  local p = '^' -- pattern being built
+  local i = 0 -- index in g
+  local c -- char at index i in g.
+
+  -- unescape glob char
+  local function unescape()
+    if c == '\\' then
+      i = i + 1
+      c = g:sub(i, i)
+      if c == '' then
+        p = '[^]'
+        return false
+      end
+    end
+    return true
+  end
+
+  -- escape pattern char
+  local function escape(c)
+    return c:match('^%w$') and c or '%' .. c
+  end
+
+  -- Convert tokens at end of charset.
+  local function charset_end()
+    while 1 do
+      if c == '' then
+        p = '[^]'
+        return false
+      elseif c == ']' then
+        p = p .. ']'
+        break
+      else
+        if not unescape() then
+          break
+        end
+        local c1 = c
+        i = i + 1
+        c = g:sub(i, i)
+        if c == '' then
+          p = '[^]'
+          return false
+        elseif c == '-' then
+          i = i + 1
+          c = g:sub(i, i)
+          if c == '' then
+            p = '[^]'
+            return false
+          elseif c == ']' then
+            p = p .. escape(c1) .. '%-]'
+            break
+          else
+            if not unescape() then
+              break
+            end
+            p = p .. escape(c1) .. '-' .. escape(c)
+          end
+        elseif c == ']' then
+          p = p .. escape(c1) .. ']'
+          break
+        else
+          p = p .. escape(c1)
+          i = i - 1 -- put back
+        end
+      end
+      i = i + 1
+      c = g:sub(i, i)
+    end
+    return true
+  end
+
+  -- Convert tokens in charset.
+  local function charset()
+    i = i + 1
+    c = g:sub(i, i)
+    if c == '' or c == ']' then
+      p = '[^]'
+      return false
+    elseif c == '^' or c == '!' then
+      i = i + 1
+      c = g:sub(i, i)
+      if c == ']' then
+        -- ignored
+      else
+        p = p .. '[^'
+        if not charset_end() then
+          return false
+        end
+      end
+    else
+      p = p .. '['
+      if not charset_end() then
+        return false
+      end
+    end
+    return true
+  end
+
+  -- Convert tokens.
+  while 1 do
+    i = i + 1
+    c = g:sub(i, i)
+    if c == '' then
+      p = p .. '$'
+      break
+    elseif c == '?' then
+      p = p .. '.'
+    elseif c == '*' then
+      p = p .. '.*'
+    elseif c == '[' then
+      if not charset() then
+        break
+      end
+    elseif c == '\\' then
+      i = i + 1
+      c = g:sub(i, i)
+      if c == '' then
+        p = p .. '\\$'
+        break
+      end
+      p = p .. escape(c)
+    else
+      p = p .. escape(c)
+    end
+  end
+  return p
+end
+
+---@class CopilotChat.Diagnostic
+---@field content string
+---@field start_line number
+---@field end_line number
+---@field severity string
+
+--- Get diagnostics in a given range
+--- @param bufnr number
+--- @param start_line number?
+--- @param end_line number?
+--- @return table<CopilotChat.Diagnostic>|nil
+function M.diagnostics(bufnr, start_line, end_line)
+  local diagnostics = vim.diagnostic.get(bufnr)
+  local range_diagnostics = {}
+  local severity = {
+    [1] = 'ERROR',
+    [2] = 'WARNING',
+    [3] = 'INFORMATION',
+    [4] = 'HINT',
+  }
+
+  for _, diagnostic in ipairs(diagnostics) do
+    local lnum = diagnostic.lnum + 1
+    if (not start_line or lnum >= start_line) and (not end_line or lnum <= end_line) then
+      table.insert(range_diagnostics, {
+        severity = severity[diagnostic.severity],
+        content = diagnostic.message,
+        start_line = lnum,
+        end_line = diagnostic.end_lnum and diagnostic.end_lnum + 1 or lnum,
+      })
+    end
+  end
+
+  return #range_diagnostics > 0 and range_diagnostics or nil
+end
 
 return M

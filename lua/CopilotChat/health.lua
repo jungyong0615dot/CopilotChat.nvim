@@ -40,27 +40,20 @@ local function treesitter_parser_available(ft)
 end
 
 function M.check()
-  start('CopilotChat.nvim')
-  info('If you are facing any issues, also see :CopilotChatDebugInfo for more information.')
-
   start('CopilotChat.nvim [core]')
 
   local vim_version = vim.trim(vim.api.nvim_command_output('version'))
-  local dev_number = tonumber(vim_version:match('dev%-(%d+)'))
-
-  if dev_number then
-    local to_check = vim.fn.has('nvim-0.11.0') and 0 or 2500
-    if dev_number >= to_check then
-      ok('nvim: ' .. vim_version)
-    else
-      error(
-        'nvim: outdated, please upgrade to a up to date nightly version. See "https://github.com/neovim/neovim".'
-      )
-    end
-  elseif vim.fn.has('nvim-0.9.5') == 1 then
+  if vim.fn.has('nvim-0.10.0') == 1 then
     ok('nvim: ' .. vim_version)
   else
-    error('nvim: unsupported, please upgrade to 0.9.5 or later. See "https://neovim.io/".')
+    error('nvim: unsupported, please upgrade to 0.10.0 or later. See "https://neovim.io/".')
+  end
+
+  local setup_called = require('CopilotChat').config ~= nil
+  if setup_called then
+    ok('setup: called')
+  else
+    error('setup: not called, required for plugin to work. See `:h CopilotChat-installation`.')
   end
 
   start('CopilotChat.nvim [commands]')
@@ -77,6 +70,15 @@ function M.check()
     warn('git: missing, required for git-related commands. See "https://git-scm.com/".')
   else
     ok('git: ' .. git_version)
+  end
+
+  local rg_version = run_command('rg', '--version')
+  if rg_version == false then
+    warn(
+      'rg: missing, optional for improved search performance. See "https://github.com/BurntSushi/ripgrep".'
+    )
+  else
+    ok('rg: ' .. rg_version)
   end
 
   local lynx_version = run_command('lynx', '-version')
@@ -108,6 +110,15 @@ function M.check()
     )
   end
 
+  local select_source = debug.getinfo(vim.ui.select).source
+  if select_source:match('vim/ui%.lua$') then
+    warn(
+      'vim.ui.select: using default implementation, which may not provide the best user experience. See `:h CopilotChat-integration-with-pickers`.'
+    )
+  else
+    ok('vim.ui.select: overridden by `' .. select_source .. '`')
+  end
+
   if lualib_installed('tiktoken_core') then
     ok('tiktoken_core: installed')
   else
@@ -120,7 +131,7 @@ function M.check()
     ok('treesitter[markdown]: installed')
   else
     warn(
-      'treesitter[markdown]: missing, optional for better chat highlighting. Install "nvim-treesitter/nvim-treesitter" plugin and run ":TSInstall markdown".'
+      'treesitter[markdown]: missing, optional for better chat highlighting. Install `nvim-treesitter/nvim-treesitter` plugin and run `:TSInstall markdown`.'
     )
   end
 
@@ -128,7 +139,7 @@ function M.check()
     ok('treesitter[diff]: installed')
   else
     warn(
-      'treesitter[diff]: missing, optional for better diff highlighting. Install "nvim-treesitter/nvim-treesitter" plugin and run ":TSInstall diff".'
+      'treesitter[diff]: missing, optional for better diff highlighting. Install `nvim-treesitter/nvim-treesitter` plugin and run `:TSInstall diff`.'
     )
   end
 end

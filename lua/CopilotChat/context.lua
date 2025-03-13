@@ -11,16 +11,20 @@
 ---@field content string
 ---@field filename string
 ---@field filetype string
----@field original string?
+---@field outline string?
+---@field diagnostics table<CopilotChat.Diagnostic>?
 ---@field symbols table<string, CopilotChat.context.symbol>?
 ---@field embedding table<number>?
+---@field score number?
 
 local async = require('plenary.async')
 local log = require('plenary.log')
+local client = require('CopilotChat.client')
 local notify = require('CopilotChat.notify')
 local utils = require('CopilotChat.utils')
 local file_cache = {}
 local url_cache = {}
+local embedding_cache = {}
 
 local M = {}
 
@@ -64,8 +68,8 @@ local OFF_SIDE_RULE_LANGUAGES = {
   'fsharp',
 }
 
-local TOP_SYMBOLS = 64
-local TOP_RELATED = 20
+local MIN_SYMBOL_SIMILARITY = 0.3
+local MIN_SEMANTIC_SIMILARITY = 0.4
 local MULTI_FILE_THRESHOLD = 5
 
 --- Compute the cosine similarity between two vectors
@@ -73,6 +77,10 @@ local MULTI_FILE_THRESHOLD = 5
 ---@param b table<number>
 ---@return number
 local function spatial_distance_cosine(a, b)
+  if not a or not b then
+    return 0
+  end
+
   local dot_product = 0
   local magnitude_a = 0
   local magnitude_b = 0
@@ -89,78 +97,135 @@ end
 --- Rank data by relatedness to the query
 ---@param query CopilotChat.context.embed
 ---@param data table<CopilotChat.context.embed>
----@param top_n number
+---@param min_similarity number
 ---@return table<CopilotChat.context.embed>
-local function data_ranked_by_relatedness(query, data, top_n)
-  data = vim.tbl_map(function(item)
-    return vim.tbl_extend(
-      'force',
-      item,
-      { score = spatial_distance_cosine(item.embedding, query.embedding) }
-    )
-  end, data)
+local function data_ranked_by_relatedness(query, data, min_similarity)
+  for _, item in ipairs(data) do
+    local score = spatial_distance_cosine(item.embedding, query.embedding)
+    item.score = score or item.score or 0
+  end
 
   table.sort(data, function(a, b)
     return a.score > b.score
   end)
 
-  return vim.list_slice(data, 1, top_n)
+  -- Return top items meeting threshold
+  local filtered = {}
+  for i, result in ipairs(data) do
+    if (result.score >= min_similarity) or (i <= MULTI_FILE_THRESHOLD) then
+      table.insert(filtered, result)
+    end
+  end
+
+  return filtered
 end
 
---- Rank data by symbols
+-- Create trigrams from text (e.g., "hello" -> {"hel", "ell", "llo"})
+local function get_trigrams(text)
+  local trigrams = {}
+  text = text:lower()
+  for i = 1, #text - 2 do
+    trigrams[text:sub(i, i + 2)] = true
+  end
+  return trigrams
+end
+
+-- Calculate Jaccard similarity between two trigram sets
+local function trigram_similarity(set1, set2)
+  local intersection = 0
+  local union = 0
+
+  -- Count intersection and union
+  for trigram in pairs(set1) do
+    if set2[trigram] then
+      intersection = intersection + 1
+    end
+    union = union + 1
+  end
+
+  for trigram in pairs(set2) do
+    if not set1[trigram] then
+      union = union + 1
+    end
+  end
+
+  return intersection / union
+end
+
+--- Rank data by symbols and filenames
 ---@param query string
 ---@param data table<CopilotChat.context.embed>
----@param top_n number
-local function data_ranked_by_symbols(query, data, top_n)
-  local query_terms = {}
-  for term in query:lower():gmatch('%w+') do
-    query_terms[term] = true
+---@param min_similarity number
+---@return table<CopilotChat.context.embed>
+local function data_ranked_by_symbols(query, data, min_similarity)
+  -- Get query trigrams including compound versions
+  local query_trigrams = {}
+
+  -- Add trigrams for each word
+  for term in query:gmatch('%w+') do
+    for trigram in pairs(get_trigrams(term)) do
+      query_trigrams[trigram] = true
+    end
   end
 
-  local results = {}
+  -- Add trigrams for compound query
+  local compound_query = query:gsub('[^%w]', '')
+  for trigram in pairs(get_trigrams(compound_query)) do
+    query_trigrams[trigram] = true
+  end
+
+  local max_score = 0
+
   for _, entry in ipairs(data) do
-    local score = 0
-    local filename = entry.filename and entry.filename:lower() or ''
+    local basename = utils.filename(entry.filename):gsub('%..*$', '')
 
-    -- Filename matches (highest priority)
-    for term in pairs(query_terms) do
-      if filename:find(term, 1, true) then
-        score = score + 15
-        if vim.fn.fnamemodify(filename, ':t'):gsub('%..*$', '') == term then
-          score = score + 10
-        end
-      end
-    end
+    -- Get trigrams for basename and compound version
+    local file_trigrams = get_trigrams(basename)
+    local compound_trigrams = get_trigrams(basename:gsub('[^%w]', ''))
 
-    -- Symbol matches
+    -- Calculate similarities
+    local name_sim = trigram_similarity(query_trigrams, file_trigrams)
+    local compound_sim = trigram_similarity(query_trigrams, compound_trigrams)
+
+    -- Take best match
+    local score = (entry.score or 0) + math.max(name_sim, compound_sim)
+
+    -- Add symbol matches
     if entry.symbols then
+      local symbol_score = 0
       for _, symbol in ipairs(entry.symbols) do
-        for term in pairs(query_terms) do
-          -- Check symbol name (high priority)
-          if symbol.name and symbol.name:lower():find(term, 1, true) then
-            score = score + 5
-            if symbol.name:lower() == term then
-              score = score + 3
-            end
-          end
-
-          -- Check signature (medium priority)
-          -- This catches parameter names, return types, etc
-          if symbol.signature and symbol.signature:lower():find(term, 1, true) then
-            score = score + 2
-          end
+        if symbol.name then
+          local symbol_trigrams = get_trigrams(symbol.name)
+          local sym_sim = trigram_similarity(query_trigrams, symbol_trigrams)
+          symbol_score = math.max(symbol_score, sym_sim)
         end
       end
+      score = score + (symbol_score * 0.5) -- Weight symbol matches less
     end
 
-    table.insert(results, vim.tbl_extend('force', entry, { score = score }))
+    max_score = math.max(max_score, score)
+    entry.score = score
   end
 
-  table.sort(results, function(a, b)
+  -- Normalize scores
+  for _, entry in ipairs(data) do
+    entry.score = entry.score / max_score
+  end
+
+  -- Sort by score first
+  table.sort(data, function(a, b)
     return a.score > b.score
   end)
 
-  return vim.list_slice(results, 1, top_n)
+  -- Filter results while preserving top scores
+  local filtered_results = {}
+  for i, result in ipairs(data) do
+    if (result.score >= min_similarity) or (i <= MULTI_FILE_THRESHOLD) then
+      table.insert(filtered_results, result)
+    end
+  end
+
+  return filtered_results
 end
 
 --- Get the full signature of a declaration
@@ -204,6 +269,7 @@ end
 ---@param ft string
 ---@return CopilotChat.context.embed
 local function build_outline(content, filename, ft)
+  ---@type CopilotChat.context.embed
   local output = {
     filename = filename,
     filetype = ft,
@@ -269,8 +335,7 @@ local function build_outline(content, filename, ft)
   parse_node(root)
 
   if #outline_lines > 0 then
-    output.original = content
-    output.content = table.concat(outline_lines, '\n')
+    output.outline = table.concat(outline_lines, '\n')
     output.symbols = symbols
   end
 
@@ -282,6 +347,8 @@ end
 ---@param filetype string
 ---@return CopilotChat.context.embed?
 local function get_file(filename, filetype)
+  notify.publish(notify.STATUS, 'Reading file ' .. filename)
+
   local modified = utils.file_mtime(filename)
   if not modified then
     return nil
@@ -308,25 +375,42 @@ end
 
 --- Get list of all files in workspace
 ---@param winnr number?
----@param with_content boolean
+---@param with_content boolean?
+---@param search_options CopilotChat.utils.scan_dir_opts?
 ---@return table<CopilotChat.context.embed>
-function M.files(winnr, with_content)
+function M.files(winnr, with_content, search_options)
   local cwd = utils.win_cwd(winnr)
 
   notify.publish(notify.STATUS, 'Scanning files')
 
-  local files = utils.scan_dir(cwd, {
-    add_dirs = false,
-    respect_gitignore = true,
-  })
+  local files = utils.scan_dir(cwd, search_options)
 
   notify.publish(notify.STATUS, 'Reading files')
 
   local out = {}
 
-  -- Read all files if we want content as well
+  -- Create file list in chunks
+  local chunk_size = 100
+  for i = 1, #files, chunk_size do
+    local chunk = {}
+    for j = i, math.min(i + chunk_size - 1, #files) do
+      table.insert(chunk, files[j])
+    end
+
+    local chunk_number = math.floor(i / chunk_size)
+    local chunk_name = chunk_number == 0 and 'file_map' or 'file_map' .. tostring(chunk_number)
+
+    table.insert(out, {
+      content = table.concat(chunk, '\n'),
+      filename = chunk_name,
+      filetype = 'text',
+      score = 0.1,
+    })
+  end
+
+  -- Read file contents
   if with_content then
-    async.util.scheduler()
+    utils.schedule_main()
 
     files = vim.tbl_filter(
       function(file)
@@ -346,26 +430,6 @@ function M.files(winnr, with_content)
         table.insert(out, file_data)
       end
     end
-
-    return out
-  end
-
-  -- Create file list in chunks
-  local chunk_size = 100
-  for i = 1, #files, chunk_size do
-    local chunk = {}
-    for j = i, math.min(i + chunk_size - 1, #files) do
-      table.insert(chunk, files[j])
-    end
-
-    local chunk_number = math.floor(i / chunk_size)
-    local chunk_name = chunk_number == 0 and 'file_map' or 'file_map' .. tostring(chunk_number)
-
-    table.insert(out, {
-      content = table.concat(chunk, '\n'),
-      filename = chunk_name,
-      filetype = 'text',
-    })
   end
 
   return out
@@ -379,9 +443,7 @@ function M.file(filename)
     return nil
   end
 
-  notify.publish(notify.STATUS, 'Reading file ' .. filename)
-
-  async.util.scheduler()
+  utils.schedule_main()
   local ft = utils.filetype(filename)
   if not ft then
     return nil
@@ -394,7 +456,8 @@ end
 ---@param bufnr number
 ---@return CopilotChat.context.embed?
 function M.buffer(bufnr)
-  async.util.scheduler()
+  notify.publish(notify.STATUS, 'Reading buffer ' .. bufnr)
+  utils.schedule_main()
 
   if not utils.buf_valid(bufnr) then
     return nil
@@ -405,18 +468,22 @@ function M.buffer(bufnr)
     return nil
   end
 
-  return build_outline(
+  local out = build_outline(
     table.concat(content, '\n'),
     utils.filepath(vim.api.nvim_buf_get_name(bufnr)),
     vim.bo[bufnr].filetype
   )
+
+  out.score = 0.1
+  out.diagnostics = utils.diagnostics(bufnr)
+  return out
 end
 
 --- Get content of all buffers
 ---@param buf_type string
 ---@return table<CopilotChat.context.embed>
 function M.buffers(buf_type)
-  async.util.scheduler()
+  utils.schedule_main()
 
   return vim.tbl_map(
     M.buffer,
@@ -507,6 +574,10 @@ function M.gitdiff(type, winnr)
 
   if type == 'staged' then
     table.insert(cmd, '--staged')
+  elseif type == 'unstaged' then
+    table.insert(cmd, '--')
+  else
+    table.insert(cmd, type)
   end
 
   local out = utils.system(cmd)
@@ -522,6 +593,9 @@ end
 ---@param register string
 ---@return CopilotChat.context.embed?
 function M.register(register)
+  notify.publish(notify.STATUS, 'Reading register ' .. register)
+  utils.schedule_main()
+
   local lines = vim.fn.getreg(register)
   if not lines or lines == '' then
     return nil
@@ -534,47 +608,151 @@ function M.register(register)
   }
 end
 
+--- Get the content of the quickfix list
+---@return table<CopilotChat.context.embed>
+function M.quickfix()
+  notify.publish(notify.STATUS, 'Reading quickfix list')
+  utils.schedule_main()
+
+  local items = vim.fn.getqflist()
+  if not items or #items == 0 then
+    return {}
+  end
+
+  local unique_files = {}
+  for _, item in ipairs(items) do
+    local filename = item.filename or vim.api.nvim_buf_get_name(item.bufnr)
+    if filename then
+      unique_files[filename] = true
+    end
+  end
+
+  local files = vim.tbl_filter(
+    function(file)
+      return file.ft ~= nil
+    end,
+    vim.tbl_map(function(file)
+      return {
+        name = utils.filepath(file),
+        ft = utils.filetype(file),
+      }
+    end, vim.tbl_keys(unique_files))
+  )
+
+  local out = {}
+  for _, file in ipairs(files) do
+    local file_data = get_file(file.name, file.ft)
+    if file_data then
+      table.insert(out, file_data)
+    end
+  end
+  return out
+end
+
+--- Get the output of a system shell command
+---@param command string The command to execute
+---@return CopilotChat.context.embed?
+function M.system(command)
+  notify.publish(notify.STATUS, 'Executing command: ' .. command)
+  utils.schedule_main()
+
+  local shell, shell_flag
+  if vim.fn.has('win32') == 1 then
+    shell, shell_flag = 'cmd.exe', '/c'
+  else
+    shell, shell_flag = 'sh', '-c'
+  end
+
+  local out = utils.system({ shell, shell_flag, command })
+  if not out or out.stdout == '' then
+    return nil
+  end
+
+  return {
+    content = out.stdout,
+    filename = 'command_output_' .. command:gsub('[^%w]', '_'):sub(1, 20),
+    filetype = 'text',
+  }
+end
+
 --- Filter embeddings based on the query
----@param copilot CopilotChat.Copilot
 ---@param prompt string
+---@param model string
+---@param headless boolean
 ---@param embeddings table<CopilotChat.context.embed>
 ---@return table<CopilotChat.context.embed>
-function M.filter_embeddings(copilot, prompt, embeddings)
+function M.filter_embeddings(prompt, model, headless, embeddings)
   -- If we dont need to embed anything, just return directly
   if #embeddings < MULTI_FILE_THRESHOLD then
     return embeddings
   end
 
+  notify.publish(notify.STATUS, 'Ranking embeddings')
+
+  -- Build query from history and prompt
+  local query = prompt
+  if not headless then
+    query = table.concat(
+      vim
+        .iter(client.history)
+        :filter(function(m)
+          return m.role == 'user'
+        end)
+        :map(function(m)
+          return vim.trim(m.content)
+        end)
+        :totable(),
+      '\n'
+    ) .. '\n' .. prompt
+  end
+
   -- Rank embeddings by symbols
-  embeddings = data_ranked_by_symbols(prompt, embeddings, TOP_SYMBOLS)
+  embeddings = data_ranked_by_symbols(query, embeddings, MIN_SYMBOL_SIMILARITY)
   log.debug('Ranked data:', #embeddings)
   for i, item in ipairs(embeddings) do
     log.debug(string.format('%s: %s - %s', i, item.score, item.filename))
   end
 
-  -- Add prompt so it can be embedded
-  table.insert(embeddings, {
-    content = prompt,
-    filename = 'prompt',
+  -- Prepare embeddings for processing
+  local to_process = {}
+  local results = {}
+  for _, input in ipairs(embeddings) do
+    input.filename = input.filename or 'unknown'
+    input.filetype = input.filetype or 'text'
+    if input.content then
+      local cache_key = input.filename .. utils.quick_hash(input.content)
+      if embedding_cache[cache_key] then
+        table.insert(results, embedding_cache[cache_key])
+      else
+        table.insert(to_process, input)
+      end
+    end
+  end
+  table.insert(to_process, {
+    content = query,
+    filename = 'query',
     filetype = 'raw',
   })
 
-  -- Get embeddings from all items
-  embeddings = copilot:embed(embeddings)
+  -- Embed the data and process the results
+  for _, input in ipairs(client:embed(to_process, model)) do
+    if input.filetype ~= 'raw' then
+      local cache_key = input.filename .. utils.quick_hash(input.content)
+      embedding_cache[cache_key] = input
+    end
+    table.insert(results, input)
+  end
 
   -- Rate embeddings by relatedness to the query
-  local embedded_query = table.remove(embeddings, #embeddings)
+  local embedded_query = table.remove(results, #results)
   log.debug('Embedded query:', embedded_query.content)
-  embeddings = data_ranked_by_relatedness(embedded_query, embeddings, TOP_RELATED)
-  log.debug('Ranked embeddings:', #embeddings)
-  for i, item in ipairs(embeddings) do
+  results = data_ranked_by_relatedness(embedded_query, results, MIN_SEMANTIC_SIMILARITY)
+  log.debug('Ranked embeddings:', #results)
+  for i, item in ipairs(results) do
     log.debug(string.format('%s: %s - %s', i, item.score, item.filename))
   end
 
-  -- Return embeddings with original content
-  return vim.tbl_map(function(item)
-    return vim.tbl_extend('force', item, { content = item.original or item.content })
-  end, embeddings)
+  return results
 end
 
 return M
